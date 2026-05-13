@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import math
 
 import numpy as np
@@ -6,6 +7,7 @@ import rospy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Empty
 from tf.transformations import euler_from_quaternion
 
 
@@ -14,6 +16,7 @@ class RealTurtlebot3Navigator:
         rospy.init_node('tb3_real_robot_nav', anonymous=True)
 
         self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+        self.reset_pub = rospy.Publisher('/reset', Empty, queue_size=1)
         rospy.Subscriber('/odom', Odometry, self.odom_callback)
         rospy.Subscriber('/scan', LaserScan, self.scan_callback)
 
@@ -28,7 +31,7 @@ class RealTurtlebot3Navigator:
 
         # real world
         self.goal_x = 2.0
-        self.goal_y = 0.0
+        self.goal_y = 0.05
         # Gazebo world
         # self.goal_x = 1.5
         # self.goal_y = 2.5
@@ -44,10 +47,32 @@ class RealTurtlebot3Navigator:
         rospy.loginfo('Waiting for real sensor data (/odom and /scan)...')
 
     def on_shutdown(self):
-        """緊急煞車機制：確保程式關閉時實體車不會暴衝"""
+        '''緊急煞車機制：確保程式關閉時實體車不會暴衝'''
         rospy.loginfo('Shutting down! Stopping the real robot...')
         self.cmd_pub.publish(Twist())
         rospy.sleep(1)
+
+    def reset_odometry(self):
+        '''重置 Turtlebot3 的里程計 '''
+        rospy.loginfo('Waiting for /reset publisher to connect to OpenCR...')
+
+        # 如果還沒連上，就稍微等一下，絕對不提早發射指令
+        while self.reset_pub.get_num_connections() == 0 and not rospy.is_shutdown():
+            rospy.sleep(0.1)
+            
+        rospy.loginfo('Connected! Resetting OpenCR Odometry to (0,0)... Please keep the robot still.')
+        
+        # 連線建立後，連續發送兩次確保底層確實收到
+        self.reset_pub.publish(Empty())
+        rospy.sleep(0.1)
+        self.reset_pub.publish(Empty())
+        
+        # 強制等待 1.5 秒，讓硬體徹底重置，並將新的 (0,0) 座標回傳給 /odom
+        rospy.sleep(1.5) 
+        
+        # 清除舊的就緒標記，強迫程式讀取重置後的新資料
+        self.odom_ready = False 
+        rospy.loginfo('Odometry reset complete! Ready to go.')
 
     def odom_callback(self, msg):
         self.robot_x = msg.pose.pose.position.x
@@ -60,19 +85,12 @@ class RealTurtlebot3Navigator:
         self.odom_ready = True
 
     def scan_callback(self, msg):
-        """讀取實體光達資料並進行安全膨脹"""
         scan = np.array(msg.ranges)
         scan[np.isinf(scan)] = 3.5
         scan[np.isnan(scan)] = 3.5
-        scan[scan == 0.0] = 0.01
+        scan[scan == 0.0] = 3.5
 
-        # 實體車身盲區膨脹
-        inflated_scan = np.copy(scan)
-        for i in range(360):
-            window = [scan[(i + j) % 360] for j in range(-20, 21)]
-            inflated_scan[i] = min(window)
-
-        self.laser_data = inflated_scan
+        self.laser_data = scan
         self.scan_ready = True
 
     def piangle(self, angle):
@@ -109,14 +127,14 @@ class RealTurtlebot3Navigator:
         center_angle = angle_deg[action_idx]
 
         sector_dists = []
-        for offset in range(-15, 16):
+        # +/- 13 度
+        for offset in range(-13, 14):
             idx = int((center_angle + offset) % 360)
             sector_dists.append(self.laser_data[idx])
 
         min_dist_m = min(sector_dists)
-
-        # 安全距離設定
-        safe_margin = 0.8
+        
+        safe_margin = 0.9
 
         if min_dist_m < safe_margin:
             if min_dist_m < (dist_m + 0.15):
@@ -129,27 +147,27 @@ class RealTurtlebot3Navigator:
         return f
 
     def loop(self):
-        # 等待實體感測器上線
+        self.reset_odometry()
+        # 等待sensor上線
         while not (self.odom_ready and self.scan_ready) and not rospy.is_shutdown():
             rospy.sleep(0.1)
 
         rospy.loginfo('Sensors ready! Commencing Real Robot Navigation...')
 
-        rate = rospy.Rate(10)  # 10Hz 控制頻率
+        rate = rospy.Rate(10)  # 10Hz
 
         while not rospy.is_shutdown():
-            # 檢查是否到達終點 (誤差 10 公分內算抵達)
+            # 檢查是否到達終點 (誤差 10 公分內)
             current_dist = math.hypot(self.goal_x - self.robot_x, self.goal_y - self.robot_y)
             if current_dist < 0.1:
                 rospy.loginfo('🎉 成功抵達終點！')
                 self.cmd_pub.publish(Twist())  # 煞車
                 break
 
-            # 大腦決策：計算每個動作的 Q 值
+            # 計算每個動作的 Q 值
             q_vals = [np.dot(self.W, self.get_features(a)) for a in range(5)]
             best_action = np.argmax(q_vals)
 
-            # 發送物理指令給實體馬達
             cmd = Twist()
             cmd.linear.x = self.v
             cmd.angular.z = self.w_rad[best_action]
